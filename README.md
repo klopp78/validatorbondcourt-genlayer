@@ -14,3 +14,7 @@ The contract deliberately governs its own GEN service-bond escrow. It does not c
 ## Verification
 
 Run `npm test`. Deploy `contracts/validator_bond_court.py` in Studio, create a small bond, submit a dispute with two public evidence pages and inspect the finalized bond/dispute records.
+
+## Studionet deployment
+
+The submitted source is deployed at [`0xa3C52F40C515B59F35f6afa20e74De070B5dB013`](https://explorer-studio.genlayer.com/address/0xa3C52F40C515B59F35f6afa20e74De070B5dB013). The deployed ABI exposes `create_service_bond`, `open_dispute`, `resolve_dispute`, `settle_dispute`, and `recover_expired_dispute`.
