@@ -43,7 +43,7 @@ class ValidatorBondCourt(gl.Contract):
         return _json([self.bond_ids[i] for i in range(start, min(start + count, len(self.bond_ids)))])
 
     @gl.public.write.payable
-    def create_service_bond(self, client: str, service_scope: str, terms_url: str, expires_at: u64, creation_nonce: str) -> str:
+    def create_service_bond(self, client: str, service_scope: str, terms_url: str, terms_snapshot: str, expires_at: u64, creation_nonce: str) -> str:
         if gl.message.value == u256(0):
             raise Exception("positive_bond_required")
         now, expiry = _now(), int(expires_at)
@@ -53,13 +53,15 @@ class ValidatorBondCourt(gl.Contract):
         client_address = str(Address(client)).lower()
         scope = _clean(service_scope, 180, "service_scope_required")
         terms = _url(terms_url, "invalid_terms_url")
+        snapshot = _terms_snapshot(terms_snapshot)
+        terms_hash = _sha256(snapshot)
         nonce = _hash(creation_nonce, "invalid_creation_nonce")
-        canonical = {"client": client_address, "provider": provider, "schema": "validator-bond-court.v1", "service_scope": scope, "terms_url": terms}
+        canonical = {"client": client_address, "provider": provider, "schema": "validator-bond-court.v2", "service_scope": scope, "terms_url": terms, "terms_hash": terms_hash}
         bond_id = "vbc_" + _parts([_json(canonical), str(gl.message.value), str(expiry), nonce])[:20]
         if self.bonds.get(bond_id, ""):
             raise Exception("creation_nonce_already_used")
         self.bond_count = u64(int(self.bond_count) + 1)
-        bond = {"bond_id": bond_id, "canonical_service": canonical, "client": client_address, "provider": provider, "bond_gen_wei": str(gl.message.value), "expires_at": expiry, "status": "active", "dispute_id": "", "created_at": now}
+        bond = {"bond_id": bond_id, "canonical_service": canonical, "terms_snapshot": snapshot, "client": client_address, "provider": provider, "bond_gen_wei": str(gl.message.value), "expires_at": expiry, "status": "active", "dispute_id": "", "created_at": now}
         self.bonds[bond_id] = _json(bond)
         self.bond_ids.append(bond_id)
         return bond_id
@@ -87,10 +89,12 @@ class ValidatorBondCourt(gl.Contract):
     def resolve_dispute(self, dispute_id: str, provider_evidence_url: str) -> None:
         dispute = _load(self.disputes, dispute_id, "unknown_dispute")
         bond = _load(self.bonds, dispute["bond_id"], "unknown_bond")
+        if str(gl.message.sender_address).lower() != bond["provider"]:
+            raise Exception("only_named_provider_can_supply_evidence")
         if dispute["status"] != "open" or _now() <= 0 or _now() > int(dispute["resolution_deadline"]):
             raise Exception("dispute_not_resolvable")
         provider_evidence = _url(provider_evidence_url, "invalid_provider_evidence")
-        context = {"canonical_service": bond["canonical_service"], "allegation_scope": dispute["allegation_scope"], "client_evidence_url": dispute["client_evidence_url"], "provider_evidence_url": provider_evidence, "bond_id": bond["bond_id"], "bond_gen_wei": bond["bond_gen_wei"], "challenge_stake_wei": dispute["challenge_stake_wei"]}
+        context = {"canonical_service": bond["canonical_service"], "terms_snapshot": bond["terms_snapshot"], "allegation_scope": dispute["allegation_scope"], "client_evidence_url": dispute["client_evidence_url"], "provider_evidence_url": provider_evidence, "bond_id": bond["bond_id"], "bond_gen_wei": bond["bond_gen_wei"], "challenge_stake_wei": dispute["challenge_stake_wei"]}
 
         def leader_fn():
             return _json(_assess(context))
@@ -108,6 +112,21 @@ class ValidatorBondCourt(gl.Contract):
         assessment = _assessment(gl.vm.run_nondet_unsafe(leader_fn, validator_fn))
         dispute.update({"status": "resolved", "decision": assessment["decision"], "provider_evidence_url": provider_evidence, "assessment": assessment, "resolved_at": _now()})
         bond["status"] = "resolved"
+        self.disputes[dispute_id], self.bonds[bond["bond_id"]] = _json(dispute), _json(bond)
+
+    @gl.public.write
+    def recover_expired_dispute(self, dispute_id: str) -> None:
+        """After a stalled resolution window, return each party's original deposit."""
+        dispute = _load(self.disputes, dispute_id, "unknown_dispute")
+        bond = _load(self.bonds, dispute["bond_id"], "unknown_bond")
+        if dispute["status"] != "open" or bond["status"] != "disputed":
+            raise Exception("dispute_not_open")
+        if _now() <= int(dispute["resolution_deadline"]):
+            raise Exception("resolution_window_still_open")
+        _Account(Address(bond["provider"])).emit_transfer(value=u256(int(bond["bond_gen_wei"])))
+        _Account(Address(bond["client"])).emit_transfer(value=u256(int(dispute["challenge_stake_wei"])))
+        dispute.update({"status": "deadline_recovered", "decision": "unresolved_deadline", "recovered_at": _now()})
+        bond["status"] = "deadline_recovered"
         self.disputes[dispute_id], self.bonds[bond["bond_id"]] = _json(dispute), _json(bond)
 
     @gl.public.write
@@ -138,7 +157,10 @@ class ValidatorBondCourt(gl.Contract):
 
 
 def _assess(context: dict) -> dict:
-    terms, client, provider = _render(context["canonical_service"]["terms_url"]), _render(context["client_evidence_url"]), _render(context["provider_evidence_url"])
+    terms = {"readable": True, "content": context["terms_snapshot"], "hash": _sha256(context["terms_snapshot"])}
+    client, provider = _render(context["client_evidence_url"]), _render(context["provider_evidence_url"])
+    if terms["hash"] != context["canonical_service"]["terms_hash"]:
+        raise Exception("stored_terms_commitment_mismatch")
     hashes = {"terms_hash": terms["hash"], "client_evidence_hash": client["hash"], "provider_evidence_hash": provider["hash"]}
     bundle = _hash(_json({"service": context["canonical_service"], "allegation": context["allegation_scope"], **hashes}), "invalid_bundle")
     if not terms["readable"] or not client["readable"] or not provider["readable"]:
@@ -197,6 +219,10 @@ def _hash(value: str, error: str) -> str:
     return candidate
 
 
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _parts(values: list) -> str:
     return hashlib.sha256("".join(str(len(str(v))) + ":" + str(v) for v in values).encode()).hexdigest()
 
@@ -206,6 +232,13 @@ def _clean(value: str, limit: int, error: str) -> str:
     if not cleaned or len(cleaned) > limit:
         raise Exception(error)
     return cleaned
+
+
+def _terms_snapshot(value: str) -> str:
+    snapshot = _clean(value, 12000, "invalid_terms_snapshot")
+    if len(snapshot) < 80:
+        raise Exception("terms_snapshot_too_short")
+    return snapshot
 
 
 def _url(value: str, error: str) -> str:
